@@ -33,11 +33,8 @@ int main() {
     double target_yaw = random_range(-M_PI, M_PI);
     
     // Create target array (position, velocity, and desired yaw)
-    double target[7] = {
-        target_x, target_y, target_z,    // Target position
-        0.0, 0.0, 0.0,                   // Zero velocity target
-        target_yaw                       // Random target yaw
-    };
+    double target_position[3] = {target_x, target_y, target_z};
+    double target_velocity[3] = {0.0, 0.0, 0.0};
     
     printf("Drone starts at (%.2f, %.2f, %.2f), target at (%.2f, %.2f, %.2f) with yaw %.2f\n", 
            drone_x, drone_y, drone_z, target_x, target_y, target_z, target_yaw);
@@ -149,23 +146,33 @@ int main() {
         
         // Control update
         if (t_control >= DT_CONTROL) {
-            update_estimator(
-                quad.gyro_measurement,
-                quad.accel_measurement,
-                DT_CONTROL,
-                &estimator
-            );
+            // High-level: Position control
+            double desired_thrust;
+            double R_W_B_desired[9];
             
-            double new_omega[4];
-            control_quad_commands(
+            control_position(
                 quad.linear_position_W,
                 quad.linear_velocity_W,
-                estimator.R,
-                estimator.angular_velocity,
+                target_position,
+                target_velocity,
+                target_yaw,
+                &desired_thrust,
+                R_W_B_desired
+            );
+            
+            // Low-level: Attitude control
+            double new_omega[4];
+            control_attitude(
+                quad.gyro_measurement,
+                quad.accel_measurement,
+                desired_thrust,
+                R_W_B_desired,
                 quad.inertia,
-                target,
+                DT_CONTROL,
+                &estimator,
                 new_omega
             );
+            
             memcpy(quad.omega_next, new_omega, 4 * sizeof(double));
             t_control = 0.0;
         }

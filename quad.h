@@ -405,134 +405,6 @@ void update_quad_states(
     }
 }
 
-void control_quad_commands(
-    // Current state
-    const double* position,     // linear_position_W[3]
-    const double* velocity,     // linear_velocity_W[3]
-    const double* R_W_B,       // R_W_B[9]
-    const double* omega,        // angular_velocity_B[3]
-    const double* inertia,     // inertia[3]
-    // Target state
-    const double* control_input,// target state[7]
-    // Output
-    double* omega_next         // omega_next[4]
-) {
-    // 1. Calculate position and velocity errors
-    double error_p[3], error_v[3];
-    subVec3f(position, (double[]){control_input[0], control_input[1], control_input[2]}, error_p);
-    subVec3f(velocity, (double[]){control_input[3], control_input[4], control_input[5]}, error_v);
-
-    // 2. Calculate desired force vector in world frame
-    double z_W_d[3], temp[3];
-    multScalVec3f(-K_P, error_p, z_W_d);
-    multScalVec3f(-K_V, error_v, temp);
-    addVec3f(z_W_d, temp, z_W_d);
-    
-    // Add gravity compensation and desired acceleration
-    double gravity_term[3] = {0, MASS * GRAVITY, 0};
-    addVec3f(z_W_d, gravity_term, z_W_d);
-    
-    double accel_term[3];
-    multScalVec3f(MASS, (double[]){0.0, 0.0, 0.0}, accel_term);
-    addVec3f(z_W_d, accel_term, z_W_d);
-
-    // 3. Calculate thrust magnitude
-    double z_W_B[3];
-    double y_body[3] = {0, 1, 0};
-    multMatVec3f(R_W_B, y_body, z_W_B);
-    double thrust = dotVec3f(z_W_d, z_W_B);
-
-    // 4. Calculate desired rotation matrix
-    double x_tilde_d_W[3] = {sin(control_input[6]), 0.0, cos(control_input[6])};
-    double temp_cross1[3], temp_cross2[3];
-    double R_W_d_column_0[3], R_W_d_column_1[3], R_W_d_column_2[3];
-    
-    crossVec3f(z_W_d, x_tilde_d_W, temp_cross1);
-    crossVec3f(temp_cross1, z_W_d, temp_cross2);
-    normVec3f(temp_cross2, R_W_d_column_0);
-    normVec3f(temp_cross1, R_W_d_column_1);
-    normVec3f(z_W_d, R_W_d_column_2);
-
-    double R_W_d[9] = {
-        R_W_d_column_1[0], R_W_d_column_2[0], R_W_d_column_0[0],
-        R_W_d_column_1[1], R_W_d_column_2[1], R_W_d_column_0[1],
-        R_W_d_column_1[2], R_W_d_column_2[2], R_W_d_column_0[2]
-    };
-
-    // 5. Calculate rotation error
-    double R_W_d_T[9], R_W_B_T[9], temp_mat1[9], temp_mat2[9], temp_mat3[9];
-    transpMat3f(R_W_d, R_W_d_T);
-    transpMat3f(R_W_B, R_W_B_T);
-
-    multMat3f(R_W_d_T, R_W_B, temp_mat1);
-    multMat3f(R_W_B_T, R_W_d, temp_mat2);
-    subMat3f(temp_mat1, temp_mat2, temp_mat3);
-
-    double error_r[3];
-    so3vee(temp_mat3, error_r);
-    multScalVec3f(0.5, error_r, error_r);
-
-    // 6. Calculate angular velocity error
-    double temp_vec[3], error_w[3];
-    multMat3f(R_W_d_T, R_W_B, temp_mat1);
-    multMatVec3f(temp_mat1, (double[]){0.0, 0.0, 0.0}, temp_vec);
-    subVec3f(omega, temp_vec, error_w);
-
-    // 7. Calculate control torque
-    double tau_B_control[3], temp_vec2[3];
-    multScalVec3f(-K_R, error_r, tau_B_control);
-    multScalVec3f(-K_W, error_w, temp_vec2);
-    addVec3f(tau_B_control, temp_vec2, tau_B_control);
-
-    // Add angular momentum terms
-    double I_mat[9], temp_vec3[3], temp_vec4[3];
-    vecToDiagMat3f(inertia, I_mat);
-    multMatVec3f(I_mat, omega, temp_vec3);
-    crossVec3f(omega, temp_vec3, temp_vec4);
-    addVec3f(tau_B_control, temp_vec4, tau_B_control);
-
-    // Add feedforward terms
-    double term_0[3], term_1[3], temp_vec5[3];
-    multMatVec3f(R_W_d, (double[]){0.0, 0.0, 0.0}, temp_vec);
-    multMatVec3f(R_W_B_T, temp_vec, term_0);
-
-    multMatVec3f(R_W_d, (double[]){0.0, 0.0, 0.0}, temp_vec);
-    multMatVec3f(R_W_B_T, temp_vec, temp_vec2);
-    crossVec3f((double[]){0.0, 0.0, 0.0}, temp_vec2, term_1);
-
-    subVec3f(term_1, term_0, temp_vec5);
-    multMatVec3f(I_mat, temp_vec5, temp_vec);
-    subVec3f(tau_B_control, temp_vec, tau_B_control);
-
-    // 8. Calculate rotor speeds
-    double F_bar[16] = {
-        K_F, K_F, K_F, K_F,   // Thrust coefficients
-        0, 0, 0, 0,           // Roll moments
-        K_M, -K_M, K_M, -K_M, // Yaw moments
-        0, 0, 0, 0            // Pitch moments
-    };
-
-    // Calculate roll and pitch moments
-    for(int i = 0; i < 4; i++) {
-        double moment[3];
-        double pos_scaled[3];
-        multScalVec3f(K_F, (double [4][3]){{-L, 0,  L}, { L, 0,  L}, { L, 0, -L}, {-L, 0, -L}}[i], pos_scaled);
-        crossVec3f(pos_scaled, (double[3]){0, 1, 0}, moment);
-        F_bar[4 + i]  = moment[0];  // Roll
-        F_bar[12 + i] = moment[2];  // Pitch
-    }
-
-    // 9. Calculate and update rotor speeds
-    double F_bar_inv[16];
-    inv4Mat4f(F_bar, F_bar_inv);
-    double omega_sign_square[4];
-    multMatVec4f(F_bar_inv, (double[]){thrust, tau_B_control[0], tau_B_control[1], tau_B_control[2]}, omega_sign_square);
-
-    for(int i = 0; i < 4; i++) {
-        omega_next[i] = sqrt(fabs(omega_sign_square[i]));
-    }
-}
-
 typedef struct {
     double R[9];                    // Estimated rotation matrix
     double angular_velocity[3];     // Estimated angular velocity
@@ -597,6 +469,167 @@ void update_estimator(
         state->R[i] += dt * R_dot[i];
     }
     orthonormalize_rotation_matrix(state->R);
+}
+
+// High-level Position Controller
+// Computes desired thrust and attitude from position/velocity tracking
+void control_position(
+    // Current state estimates
+    const double* position,           // position[3] in world frame
+    const double* velocity,           // velocity[3] in world frame
+    // Target state
+    const double* target_position,    // target_pos[3]
+    const double* target_velocity,    // target_vel[3]
+    double target_yaw,               // desired yaw angle
+    // Outputs
+    double* desired_thrust_out,      // scalar thrust magnitude
+    double* R_W_B_desired            // desired rotation matrix[9]
+) {
+    // 1. Calculate position and velocity errors
+    double error_p[3], error_v[3];
+    subVec3f(position, target_position, error_p);
+    subVec3f(velocity, target_velocity, error_v);
+
+    // 2. Calculate desired force vector in world frame using PD control
+    double z_W_d[3], temp[3];
+    multScalVec3f(-K_P, error_p, z_W_d);
+    multScalVec3f(-K_V, error_v, temp);
+    addVec3f(z_W_d, temp, z_W_d);
+    
+    // Add gravity compensation
+    double gravity_term[3] = {0, MASS * GRAVITY, 0};
+    addVec3f(z_W_d, gravity_term, z_W_d);
+
+    // 3. Calculate desired rotation matrix from desired force and yaw
+    // Desired x-direction in world frame based on yaw
+    double x_tilde_d_W[3] = {sin(target_yaw), 0.0, cos(target_yaw)};
+    
+    // Build rotation matrix columns
+    double temp_cross1[3], temp_cross2[3];
+    double R_W_d_column_0[3], R_W_d_column_1[3], R_W_d_column_2[3];
+    
+    crossVec3f(z_W_d, x_tilde_d_W, temp_cross1);
+    crossVec3f(temp_cross1, z_W_d, temp_cross2);
+    normVec3f(temp_cross2, R_W_d_column_0);
+    normVec3f(temp_cross1, R_W_d_column_1);
+    normVec3f(z_W_d, R_W_d_column_2);
+
+    // Assemble desired rotation matrix (column-major)
+    R_W_B_desired[0] = R_W_d_column_1[0];
+    R_W_B_desired[1] = R_W_d_column_2[0];
+    R_W_B_desired[2] = R_W_d_column_0[0];
+    R_W_B_desired[3] = R_W_d_column_1[1];
+    R_W_B_desired[4] = R_W_d_column_2[1];
+    R_W_B_desired[5] = R_W_d_column_0[1];
+    R_W_B_desired[6] = R_W_d_column_1[2];
+    R_W_B_desired[7] = R_W_d_column_2[2];
+    R_W_B_desired[8] = R_W_d_column_0[2];
+
+    // 4. Calculate desired thrust magnitude
+    // Project desired force onto body y-axis (thrust direction)
+    double y_body[3] = {0, 1, 0};
+    double z_W_B_desired[3];
+    multMatVec3f(R_W_B_desired, y_body, z_W_B_desired);
+    *desired_thrust_out = dotVec3f(z_W_d, z_W_B_desired);
+}
+
+// Low-level Attitude Controller
+// Computes motor commands from attitude/thrust tracking with IMU feedback
+void control_attitude(
+    // Sensor inputs
+    const double* gyro_measurement,   // gyro[3] in body frame
+    const double* accel_measurement,  // accel[3] in body frame
+    // Desired state
+    double desired_thrust,           // desired thrust magnitude
+    const double* R_W_B_desired,     // desired rotation[9]
+    // System parameters
+    const double* inertia,           // inertia[3]
+    double dt,                       // time step for estimator update
+    // State estimator (updated in place)
+    StateEstimator* estimator,       // attitude estimator
+    // Output
+    double* omega_next               // motor commands[4]
+) {
+    // 1. Update state estimator with new IMU measurements
+    update_estimator(gyro_measurement, accel_measurement, dt, estimator);
+    
+    // 2. Calculate rotation error: e_R = 0.5 * vee(R_d^T R - R^T R_d)
+    double R_W_B_desired_T[9], R_W_B_T[9];
+    double temp_mat1[9], temp_mat2[9], temp_mat3[9];
+    
+    transpMat3f(R_W_B_desired, R_W_B_desired_T);
+    transpMat3f(estimator->R, R_W_B_T);
+    
+    multMat3f(R_W_B_desired_T, estimator->R, temp_mat1);
+    multMat3f(R_W_B_T, R_W_B_desired, temp_mat2);
+    subMat3f(temp_mat1, temp_mat2, temp_mat3);
+    
+    double error_r[3];
+    so3vee(temp_mat3, error_r);
+    multScalVec3f(0.5, error_r, error_r);
+
+    // 3. Calculate angular velocity error (assuming zero desired angular velocity)
+    double error_w[3];
+    memcpy(error_w, estimator->angular_velocity, 3 * sizeof(double));
+
+    // 4. Calculate control torque with PD control
+    double tau_B_control[3], temp_vec1[3], temp_vec2[3];
+    multScalVec3f(-K_R, error_r, tau_B_control);
+    multScalVec3f(-K_W, error_w, temp_vec1);
+    addVec3f(tau_B_control, temp_vec1, tau_B_control);
+
+    // Add gyroscopic compensation: omega x (I*omega)
+    double I_mat[9], I_omega[3], omega_cross_I_omega[3];
+    vecToDiagMat3f(inertia, I_mat);
+    multMatVec3f(I_mat, estimator->angular_velocity, I_omega);
+    crossVec3f(estimator->angular_velocity, I_omega, omega_cross_I_omega);
+    addVec3f(tau_B_control, omega_cross_I_omega, tau_B_control);
+
+    // 5. Build wrench allocation matrix F_bar
+    // Maps [thrust, tau_x, tau_y, tau_z]^T to [omega_1^2, omega_2^2, omega_3^2, omega_4^2]^T
+    double F_bar[16] = {
+        K_F, K_F, K_F, K_F,           // Thrust row
+        0, 0, 0, 0,                   // Roll row (filled below)
+        K_M, -K_M, K_M, -K_M,         // Yaw row
+        0, 0, 0, 0                    // Pitch row (filled below)
+    };
+
+    // Calculate roll and pitch moment contributions from each rotor
+    const double rotor_positions[4][3] = {
+        {-L, 0,  L},  // Rotor 0
+        { L, 0,  L},  // Rotor 1
+        { L, 0, -L},  // Rotor 2
+        {-L, 0, -L}   // Rotor 3
+    };
+    
+    for(int i = 0; i < 4; i++) {
+        double moment[3];
+        double pos_scaled[3];
+        multScalVec3f(K_F, rotor_positions[i], pos_scaled);
+        crossVec3f(pos_scaled, (double[3]){0, 1, 0}, moment);
+        F_bar[4 + i]  = moment[0];   // Roll moment
+        F_bar[12 + i] = moment[2];   // Pitch moment
+    }
+
+    // 6. Solve for rotor speeds: omega^2 = F_bar^{-1} * [thrust; tau]
+    double F_bar_inv[16];
+    inv4Mat4f(F_bar, F_bar_inv);
+    
+    double wrench[4] = {
+        desired_thrust,
+        tau_B_control[0],
+        tau_B_control[1],
+        tau_B_control[2]
+    };
+    
+    double omega_squared[4];
+    multMatVec4f(F_bar_inv, wrench, omega_squared);
+
+    // 7. Convert to rotor speeds with saturation
+    for(int i = 0; i < 4; i++) {
+        omega_next[i] = sqrt(fabs(omega_squared[i]));
+        omega_next[i] = fmax(OMEGA_MIN, fmin(OMEGA_MAX, omega_next[i]));
+    }
 }
 
 #endif // QUAD_H
