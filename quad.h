@@ -411,23 +411,27 @@ typedef struct {
     double gyro_bias[3];           // Estimated gyro bias
 } StateEstimator;
 
+// State Estimator
+// Takes raw sensor measurements and produces attitude and angular velocity estimates
 void update_estimator(
-    const double *gyro, 
-    const double *accel, 
-    double dt, 
-    StateEstimator *state
+    // Sensor inputs (raw measurements)
+    const double* gyro_measurement,   // gyro[3] - raw gyroscope reading
+    const double* accel_measurement,  // accel[3] - raw accelerometer reading
+    double dt,                        // time step
+    // State (updated in place)
+    StateEstimator* state             // estimator state
 ) {
     // Correction gains
-    const double k_R = 0.1;    // Attitude correction gain
-    const double k_angular = 2.0; // Angular velocity correction gain
-    const double k_bias = 0.01; // Bias estimation gain
+    const double k_R = 0.1;           // Attitude correction gain
+    const double k_angular = 2.0;     // Angular velocity correction gain
+    const double k_bias = 0.01;       // Bias estimation gain
 
     // 1. Normalize accelerometer reading
-    double acc_norm = sqrt(dotVec3f(accel, accel));
+    double acc_norm = sqrt(dotVec3f(accel_measurement, accel_measurement));
     double a_norm[3] = {
-        accel[0] / acc_norm,
-        accel[1] / acc_norm,
-        accel[2] / acc_norm
+        accel_measurement[0] / acc_norm,
+        accel_measurement[1] / acc_norm,
+        accel_measurement[2] / acc_norm
     };
 
     // 2. Calculate error between measured and expected gravity direction
@@ -447,7 +451,7 @@ void update_estimator(
     // 4. Apply corrections to angular velocity estimate
     for(int i = 0; i < 3; i++) {
         // Remove bias from gyro measurement
-        double unbiased_gyro = gyro[i] - state->gyro_bias[i];
+        double unbiased_gyro = gyro_measurement[i] - state->gyro_bias[i];
         // Update angular velocity estimate with bias-corrected gyro and attitude error
         state->angular_velocity[i] = unbiased_gyro + k_angular * error[i];
     }
@@ -534,46 +538,40 @@ void control_position(
 }
 
 // Low-level Attitude Controller
-// Computes motor commands from attitude/thrust tracking with IMU feedback
+// Computes motor commands from attitude/thrust tracking using estimated state
 void control_attitude(
-    // Sensor inputs
-    const double* gyro_measurement,   // gyro[3] in body frame
-    const double* accel_measurement,  // accel[3] in body frame
-    // Desired state
+    // Estimated state (from state estimator)
+    const double* R_estimated,        // estimated rotation[9]
+    const double* omega_estimated,    // estimated angular velocity[3]
+    // Desired state (from high-level controller)
     double desired_thrust,           // desired thrust magnitude
     const double* R_W_B_desired,     // desired rotation[9]
     // System parameters
     const double* inertia,           // inertia[3]
-    double dt,                       // time step for estimator update
-    // State estimator (updated in place)
-    StateEstimator* estimator,       // attitude estimator
     // Output
     double* omega_next               // motor commands[4]
 ) {
-    // 1. Update state estimator with new IMU measurements
-    update_estimator(gyro_measurement, accel_measurement, dt, estimator);
-    
-    // 2. Calculate rotation error: e_R = 0.5 * vee(R_d^T R - R^T R_d)
-    double R_W_B_desired_T[9], R_W_B_T[9];
+    // 1. Calculate rotation error: e_R = 0.5 * vee(R_d^T R - R^T R_d)
+    double R_W_B_desired_T[9], R_estimated_T[9];
     double temp_mat1[9], temp_mat2[9], temp_mat3[9];
     
     transpMat3f(R_W_B_desired, R_W_B_desired_T);
-    transpMat3f(estimator->R, R_W_B_T);
+    transpMat3f(R_estimated, R_estimated_T);
     
-    multMat3f(R_W_B_desired_T, estimator->R, temp_mat1);
-    multMat3f(R_W_B_T, R_W_B_desired, temp_mat2);
+    multMat3f(R_W_B_desired_T, R_estimated, temp_mat1);
+    multMat3f(R_estimated_T, R_W_B_desired, temp_mat2);
     subMat3f(temp_mat1, temp_mat2, temp_mat3);
     
     double error_r[3];
     so3vee(temp_mat3, error_r);
     multScalVec3f(0.5, error_r, error_r);
 
-    // 3. Calculate angular velocity error (assuming zero desired angular velocity)
+    // 2. Calculate angular velocity error (assuming zero desired angular velocity)
     double error_w[3];
-    memcpy(error_w, estimator->angular_velocity, 3 * sizeof(double));
+    memcpy(error_w, omega_estimated, 3 * sizeof(double));
 
-    // 4. Calculate control torque with PD control
-    double tau_B_control[3], temp_vec1[3], temp_vec2[3];
+    // 3. Calculate control torque with PD control
+    double tau_B_control[3], temp_vec1[3];
     multScalVec3f(-K_R, error_r, tau_B_control);
     multScalVec3f(-K_W, error_w, temp_vec1);
     addVec3f(tau_B_control, temp_vec1, tau_B_control);
@@ -581,11 +579,11 @@ void control_attitude(
     // Add gyroscopic compensation: omega x (I*omega)
     double I_mat[9], I_omega[3], omega_cross_I_omega[3];
     vecToDiagMat3f(inertia, I_mat);
-    multMatVec3f(I_mat, estimator->angular_velocity, I_omega);
-    crossVec3f(estimator->angular_velocity, I_omega, omega_cross_I_omega);
+    multMatVec3f(I_mat, omega_estimated, I_omega);
+    crossVec3f(omega_estimated, I_omega, omega_cross_I_omega);
     addVec3f(tau_B_control, omega_cross_I_omega, tau_B_control);
 
-    // 5. Build wrench allocation matrix F_bar
+    // 4. Build wrench allocation matrix F_bar
     // Maps [thrust, tau_x, tau_y, tau_z]^T to [omega_1^2, omega_2^2, omega_3^2, omega_4^2]^T
     double F_bar[16] = {
         K_F, K_F, K_F, K_F,           // Thrust row
@@ -611,7 +609,7 @@ void control_attitude(
         F_bar[12 + i] = moment[2];   // Pitch moment
     }
 
-    // 6. Solve for rotor speeds: omega^2 = F_bar^{-1} * [thrust; tau]
+    // 5. Solve for rotor speeds: omega^2 = F_bar^{-1} * [thrust; tau]
     double F_bar_inv[16];
     inv4Mat4f(F_bar, F_bar_inv);
     
@@ -625,7 +623,7 @@ void control_attitude(
     double omega_squared[4];
     multMatVec4f(F_bar_inv, wrench, omega_squared);
 
-    // 7. Convert to rotor speeds with saturation
+    // 6. Convert to rotor speeds with saturation
     for(int i = 0; i < 4; i++) {
         omega_next[i] = sqrt(fabs(omega_squared[i]));
         omega_next[i] = fmax(OMEGA_MIN, fmin(OMEGA_MAX, omega_next[i]));

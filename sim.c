@@ -146,6 +146,14 @@ int main() {
         
         // Control update
         if (t_control >= DT_CONTROL) {
+            // State estimation: fuse sensor data to get attitude estimate
+            update_estimator(
+                quad.gyro_measurement,
+                quad.accel_measurement,
+                DT_CONTROL,
+                &estimator
+            );
+            
             // High-level: Position control
             double desired_thrust;
             double R_W_B_desired[9];
@@ -163,13 +171,11 @@ int main() {
             // Low-level: Attitude control
             double new_omega[4];
             control_attitude(
-                quad.gyro_measurement,
-                quad.accel_measurement,
+                estimator.R,                // Use estimated attitude
+                estimator.angular_velocity, // Use estimated angular velocity
                 desired_thrust,
                 R_W_B_desired,
                 quad.inertia,
-                DT_CONTROL,
-                &estimator,
                 new_omega
             );
             
